@@ -7,9 +7,9 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
+import qrcode from "qrcode-terminal";
 import { LaravelClient } from "./LaravelClient";
 import { DeepSeekService } from "./DeepSeekService";
-import fs from "fs";
 import path from "path";
 import axios from "axios";
 import { Buffer } from "node:buffer";
@@ -18,6 +18,7 @@ import FormData = require("form-data");
 let sock: WASocket | null = null;
 let isConnecting = false;
 let reconnectTimer: NodeJS.Timeout | null = null;
+let reconnectAttempts = 0;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -47,10 +48,7 @@ export const sendHumanBurst = async (jid: string, text: string) => {
   for (const fragment of fragments) {
     try {
       await sock.sendPresenceUpdate("composing", jid);
-      const typingDuration = Math.min(
-        Math.max(fragment.length * 35, 1200),
-        4000,
-      );
+      const typingDuration = Math.min(Math.max(fragment.length * 35, 1200), 4000);
       await sleep(typingDuration);
 
       await sock.sendPresenceUpdate("paused", jid);
@@ -122,31 +120,32 @@ export const initWhatsApp = async () => {
     reconnectTimer = null;
   }
 
-  // Limpiar listeners y socket anterior si existía
+  // Destrucción limpia y segura de la instancia anterior
   if (sock) {
     try {
       sock.ev.removeAllListeners("connection.update");
       sock.ev.removeAllListeners("creds.update");
       sock.ev.removeAllListeners("messages.upsert");
-      sock.ws?.close();
+      sock.end(undefined);
     } catch (_) {}
     sock = null;
   }
 
-  const authDir = "./baileys_auth";
+  const authDir = path.resolve("./baileys_auth");
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true,
     logger: pino({ level: "silent" }),
-    browser: ["GNP Asesor", "Chrome", "120.0.0"],
+    // Firma de navegador fija y estándar
+    browser: ["Ubuntu", "Chrome", "125.0.6422.141"],
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
-    keepAliveIntervalMs: 15_000,
-    retryRequestDelayMs: 2_000,
+    keepAliveIntervalMs: 25_000,
   });
 
   isConnecting = false;
@@ -156,32 +155,45 @@ export const initWhatsApp = async () => {
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       latestQrString = qr;
+      console.log("\n--- ESCANEA ESTE CÓDIGO QR EN TU WHATSAPP ---");
+      qrcode.generate(qr, { small: true });
     }
 
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       console.warn(`[Socket] Conexión cerrada. Código de desconexión: ${statusCode}`);
 
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-      if (isLoggedOut) {
-        console.warn("[Socket] Sesión desvinculada desde el teléfono. Limpiando credenciales...");
-        latestQrString = null;
-        try {
-          if (fs.existsSync(authDir)) {
-            fs.rmSync(authDir, { recursive: true, force: true });
-          }
-        } catch (err: any) {
-          console.error("[Socket] Error al eliminar carpeta auth:", err.message);
-        }
-        reconnectTimer = setTimeout(initWhatsApp, 3000);
+      try {
+        sock?.ev.removeAllListeners("connection.update");
+        sock?.ev.removeAllListeners("creds.update");
+        sock?.ev.removeAllListeners("messages.upsert");
+        sock?.end(undefined);
+      } catch (_) {}
+      sock = null;
+
+      if (shouldReconnect) {
+        reconnectAttempts++;
+        // Backoff exponencial para evitar saturar el servidor si hay caída de red
+        const delay = Math.min(reconnectAttempts * 3000, 30000);
+        console.log(`[Socket] Reconectando sesión en ${delay / 1000}s (Intento ${reconnectAttempts})...`);
+        
+        reconnectTimer = setTimeout(() => {
+          isConnecting = false;
+          initWhatsApp();
+        }, delay);
       } else {
-        // En cualquier otro caso (caída de red, timeout, reinicio de WhatsApp), RECONECTAR SIEMPRE
-        console.log("[Socket] Intermitencia de red o reconexión requerida. Reintentando conexión...");
-        reconnectTimer = setTimeout(initWhatsApp, 4000);
+        // En lugar de borrar archivos automáticamente, solo se alerta
+        console.error(
+          "[Socket] ⚠️ Sesión cerrada por WhatsApp (Logged Out). Las credenciales locales se conservaron. " +
+          "Si desvinculaste manualmente el dispositivo desde tu teléfono, borra el volumen docker o la carpeta baileys_auth para regenerar el QR."
+        );
+        latestQrString = null;
       }
     } else if (connection === "open") {
-      console.log("[Socket] Conexión con WhatsApp lista y activa.");
+      console.log("[Socket] ✅ Conexión con WhatsApp lista y activa permanentemente.");
+      reconnectAttempts = 0;
       latestQrString = null;
     }
   });
@@ -200,21 +212,15 @@ export const initWhatsApp = async () => {
       const role = isFromMe ? "assistant" : "user";
       const msgType = Object.keys(msg.message)[0];
 
-      // 1. Manejo de Multimedia (Fotos, Audios, Documentos)
-      if (
-        ["imageMessage", "audioMessage", "documentMessage"].includes(msgType)
-      ) {
+      if (["imageMessage", "audioMessage", "documentMessage"].includes(msgType)) {
         downloadMediaMessage(msg, "buffer", {})
           .then(async (buffer) => {
             const mediaInfo = (msg.message as any)[msgType];
-            const mimeType: string =
-              mediaInfo?.mimetype || "application/octet-stream";
+            const mimeType: string = mediaInfo?.mimetype || "application/octet-stream";
 
             let ext = "bin";
-            if (mimeType.includes("ogg") || mimeType.includes("opus"))
-              ext = "ogg";
-            else if (mimeType.includes("jpeg") || mimeType.includes("jpg"))
-              ext = "jpg";
+            if (mimeType.includes("ogg") || mimeType.includes("opus")) ext = "ogg";
+            else if (mimeType.includes("jpeg") || mimeType.includes("jpg")) ext = "jpg";
             else if (mimeType.includes("png")) ext = "png";
             else if (mimeType.includes("pdf")) ext = "pdf";
             else if (mimeType.includes("mp4")) ext = "mp4";
@@ -225,7 +231,6 @@ export const initWhatsApp = async () => {
             form.append("type", msgType.replace("Message", ""));
             form.append("mime_type", mimeType);
             form.append("caption", mediaInfo?.caption || "");
-
             form.append("file", buffer as Buffer, {
               filename: `media_${Date.now()}.${ext}`,
               contentType: mimeType,
@@ -237,8 +242,7 @@ export const initWhatsApp = async () => {
               {
                 headers: {
                   ...form.getHeaders(),
-                  "X-Internal-Secret":
-                    process.env.INTERNAL_API_SECRET_TOKEN || "",
+                  "X-Internal-Secret": process.env.INTERNAL_API_SECRET_TOKEN || "",
                 },
                 maxContentLength: Infinity,
                 maxBodyLength: Infinity,
@@ -253,9 +257,7 @@ export const initWhatsApp = async () => {
         continue;
       }
 
-      // 2. Manejo de Texto
-      const text =
-        msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
       if (!text.trim()) continue;
 
       if (isFromMe) {
