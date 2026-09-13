@@ -2,10 +2,13 @@ services:
   whatsapp-bot:
     build: .
     container_name: gnp_whatsapp_bot
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     volumes:
-      - ./baileys_auth:/app/baileys_auth
+      - baileys_data:/app/baileys_auth
     ports:
       - "54321:54321"
+
+volumes:
+  baileys_data:
